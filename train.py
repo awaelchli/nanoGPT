@@ -38,7 +38,7 @@ wandb_entity = 'karpathy'
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'shakespeare'
 batch_size = 8
 block_size = 1024
 # model
