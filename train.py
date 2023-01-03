@@ -18,8 +18,8 @@ from ast import literal_eval
 import wandb
 import numpy as np
 import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+
+from lightning.fabric import Fabric, seed_everything
 
 from model import GPTConfig, GPT
 
@@ -38,11 +38,10 @@ wandb_entity = 'karpathy'
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'shakespeare'
 batch_size = 8
 block_size = 1024
 # model
-device = 'cuda:0'
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 dropout = 0.1
 n_layer = 12
@@ -60,7 +59,7 @@ lr_decay_iters = 320000 # how many steps to decay the learning rate for
 min_lr = 1e-5 # minimum learning rate
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 # poor man's Configurator. Potentially a bad idea. Example usage:
 # $ python train.py override_file --batch_size=32
@@ -94,17 +93,14 @@ for arg in sys.argv[1:]:
         else:
             raise ValueError(f"Unknown config key: {key}")
 # -----------------------------------------------------------------------------
-ddp = int(os.environ.get('LOCAL_RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    init_process_group(backend=backend)
-    gpu_id = int(os.environ["LOCAL_RANK"])
-    device = f"cuda:{gpu_id}"
-else:
-    gpu_id = 0 # gpu_id 0 means this is the (single) master process, basically
 
-if gpu_id == 0:
+fabric = Fabric(accelerator="cuda", devices=1, precision="bf16")
+fabric.launch()
+
+if fabric.global_rank == 0:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + gpu_id) # note: each worker gets a different seed
+
+seed_everything(1337 + fabric.global_rank) # note: each worker gets a different seed
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 
@@ -117,7 +113,7 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    x, y = x.to(device), y.to(device)
+    x, y = fabric.to_device((x, y))
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -128,14 +124,14 @@ best_val_loss = 1e9
 model_args = dict(n_layer = n_layer, n_head = n_head, n_embd = n_embd, block_size = block_size, dropout = dropout)
 if init_from == 'scratch':
     # init a new model from scratch
-    print("Initializing a new model from scratch")
+    fabric.print("Initializing a new model from scratch")
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
+    fabric.print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path)
     checkpoint_model_args = checkpoint['model_args']
     for k, v in model_args.items():
         assert checkpoint_model_args[k] == v, "for now"
@@ -153,7 +149,7 @@ elif init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+    fabric.print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
@@ -164,7 +160,6 @@ elif init_from.startswith('gpt2'):
 # crop down the model block size if desired
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
-model.to(device)
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, betas)
@@ -173,13 +168,13 @@ if init_from == 'resume':
 
 # compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
+    fabric.print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[gpu_id])
+
+model, optimizer = fabric.setup(model, optimizer)
+
 
 @torch.no_grad()
 def estimate_loss():
@@ -189,8 +184,7 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits, loss = model(X, Y)
+            logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -211,7 +205,7 @@ def get_lr(iter):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
-if wandb_log and gpu_id == 0:
+if wandb_log and fabric.global_rank == 0:
     wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name)
     wandb.config = {
         "batch_size": batch_size,
@@ -231,9 +225,9 @@ while True:
     else:
         lr = learning_rate
 
-    if iter_num % eval_interval == 0 and gpu_id == 0:
+    if iter_num % eval_interval == 0 and fabric.global_rank == 0:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        fabric.print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -243,40 +237,35 @@ while True:
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
-            raw_model = model.module if ddp else model
             if iter_num > 0:
                 checkpoint = {
-                    'model': raw_model.state_dict(),
+                    'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                fabric.print(f"saving checkpoint to {out_dir}")
+                fabric.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
     X, Y = get_batch('train')
-    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-        logits, loss = model(X, Y)
+    logits, loss = model(X, Y)
 
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+    fabric.backward(loss)
     # TODO: gradient clipping evaluate need for
     optimizer.step()
 
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and gpu_id == 0:
+    if iter_num % log_interval == 0 and fabric.global_rank == 0:
         lossf = loss.item() # loss as float. TODO CPU-GPU sync: profile, make sure not slow af
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+        fabric.print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     iter_num += 1
 
     # termination conditions
     if iter_num > max_iters:
         break
-
-if ddp:
-    destroy_process_group()
