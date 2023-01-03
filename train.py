@@ -60,7 +60,7 @@ lr_decay_iters = 320000 # how many steps to decay the learning rate for
 min_lr = 1e-5 # minimum learning rate
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 # poor man's Configurator. Potentially a bad idea. Example usage:
 # $ python train.py override_file --batch_size=32
